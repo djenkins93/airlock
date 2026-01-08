@@ -1,0 +1,173 @@
+.TH AIRLOCK 1 "2026-01-07" "Airlock 3.1" "User Commands"
+.SH NAME
+airlock \- software airgap utility to seal/unseal network access on a Linux host
+.SH SYNOPSIS
+.B airlock
+.RI [ command ] " " [ options ]
+.PP
+.B airlock
+.RI [ seal | on ]
+.RI [ options ]
+.PP
+.B airlock
+.RI [ unseal | off ]
+.PP
+.B airlock
+.RI [ status | monitor | log | repair | clear | help ]
+.SH DESCRIPTION
+Airlock is a root-only, software-based “airgap” tool that can quickly disable networking on a Linux system and later restore it.
+It uses a layered approach (interface down, rfkill where available, firewall drops, blackhole routing, DNS handling, etc.) and can optionally escalate to more aggressive isolation modes.
+.PP
+Airlock is intended for incident response, privacy/OPSEC workflows, and rapid “panic switch” network isolation.
+.SH COMMANDS
+.TP
+.BR seal ", " on
+Seal the airlock and block network access using the currently selected isolation mode.
+.TP
+.BR unseal ", " off
+Unseal the airlock and attempt to restore normal networking.
+.TP
+.B status
+Show current state and mode information.
+.TP
+.B monitor
+Live monitor of blocked traffic events (follows kernel log output while sealed).
+.TP
+.B log
+Show a summary of blocked connection events collected while sealed.
+.TP
+.B repair
+Force a best-effort network repair (flushes rules/routes, re-enables interfaces, restores DNS backup if available).
+.TP
+.B clear
+Clear Airlock log files.
+.TP
+.BR help ", " -h ", " \?
+Show detailed help and an FAQ-style overview.
+.PP
+If no command is provided, Airlock launches an interactive TUI menu.
+.SH OPTIONS
+.TP
+.B --paranoid
+Enable paranoid mode. Adds kernel module unloading to the standard seal routine.
+.TP
+.B --vault
+Enable vault mode (maximum isolation). Adds USB blocking rules, module load prevention, aggressive process termination, and memory/cache wiping steps during sealing.
+.TP
+.B --watchdog
+Enable watchdog mode. Automatically unseals after the default timeout (300 seconds).
+.TP
+.BI --watchdog= SEC
+Enable watchdog mode and set the auto-unseal timeout to
+.IR SEC
+seconds.
+.SH ISOLATION MODES
+Airlock exposes three modes (selectable via options or the interactive menu):
+.TP
+.B Standard
+Firewall + blackhole routing + rfkill (if present) + interface control + DNS handling.
+.TP
+.B Paranoid
+Standard mode plus kernel module unloading to reduce the chance of network driver reactivation.
+.TP
+.B Vault
+Paranoid mode plus “maximum isolation” actions (USB/network device blocking, module load prevention, aggressive process termination, and cache/memory wipe operations).
+.SH INTERACTIVE MENU
+When run without a command, Airlock presents a menu allowing you to:
+seal/unseal, view status, monitor blocked traffic, view logs, force repair, clear logs, and toggle Paranoid/Vault/Watchdog modes.
+.SH FILES
+.TP
+.I /var/run/airlock.state
+State file indicating whether Airlock is sealed and which mode(s) are active.
+.TP
+.I /var/log/airlock/airlock.log
+Operational log (actions taken, warnings, errors).
+.TP
+.I /var/log/airlock/blocked.log
+Blocked traffic/event log captured while sealed (derived from kernel log messages).
+.TP
+.I /etc/resolv.conf.airlock.bak
+Backup copy of DNS configuration created before sealing (when applicable).
+.TP
+.I /etc/modprobe.d/airlock-block.conf
+Kernel module blacklist / load prevention configuration used in vault mode.
+.TP
+.I /etc/udev/rules.d/99-airlock-block-usb-net.rules
+udev rules for blocking USB/network devices in vault mode.
+.SH DEPENDENCIES
+Airlock requires:
+.TP
+.B ip
+(from iproute2)
+.TP
+.B iptables
+(for firewall drops and logging)
+.PP
+Optional:
+.TP
+.B rfkill
+For radio-level wireless disabling when available.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Usage error, missing dependency, not running as root, or a failure during sealing/unsealing/repair steps.
+.SH EXAMPLES
+Seal using standard mode:
+.PP
+.nf
+sudo airlock seal
+.fi
+.PP
+Seal with kernel module unloading:
+.PP
+.nf
+sudo airlock seal --paranoid
+.fi
+.PP
+Maximum isolation:
+.PP
+.nf
+sudo airlock seal --vault
+.fi
+.PP
+Seal with a 10-minute auto-unseal:
+.PP
+.nf
+sudo airlock seal --watchdog=600
+.fi
+.PP
+Check state:
+.PP
+.nf
+sudo airlock status
+.fi
+.PP
+Restore networking:
+.PP
+.nf
+sudo airlock unseal
+.fi
+.SH SECURITY NOTES
+Airlock is a powerful networking “kill switch.” It makes best-effort changes to firewall rules, routes, interfaces, and DNS state.
+You should understand and test Airlock on your specific distro/network stack before relying on it in critical situations.
+.PP
+Because Airlock modifies firewall/routing/DNS state and may write udev/modprobe configuration in vault mode, it must be run as root and should be treated as a privileged security tool.
+.SH BUGS
+If unsealing does not fully restore connectivity, try:
+.BR airlock\ repair
+and then inspect:
+.BR ip\ addr ,
+.BR ip\ route ,
+and
+.IR /etc/resolv.conf .
+.SH AUTHOR
+Dietrich Jenkins.
+.SH LICENSE
+MIT.
+.SH SEE ALSO
+.BR ip (8),
+.BR iptables (8),
+.BR rfkill (8)
