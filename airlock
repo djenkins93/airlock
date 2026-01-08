@@ -1,0 +1,1394 @@
+#!/bin/bash
+# 
+# Airlock v3.1 - Enhanced software airgap utility for privacy-focused Linux systems
+# 
+# Provides layered network isolation through:
+#   - Firewall blocking (iptables + nftables fallback)
+#   - Blackhole routing (IPv4 + IPv6)
+#   - Wireless radio kill (rfkill)
+#   - Interface state control
+#   - USB network device blocking
+#   - Module loading prevention
+#   - Network process termination
+#   - Memory/clipboard sanitization
+#   - Optional: kernel module unloading (paranoid mode)
+#   - Optional: maximum isolation (vault mode)
+#
+# Designed for Void Linux but compatible with most systemd/runit/OpenRC systems
+#
+# Usage: airlock [seal|unseal|status|monitor|log|repair|help] [options]
+#
+# Author: Dietrich Jenkins
+# License: MIT
+# Repository: https://github.com/djenkins93/airlock
+#
+set -o pipefail
+
+# === Configuration ===
+VERSION="3.1"
+PROGRAM_NAME="AIRLOCK"
+STATE_FILE="/var/run/airlock.state"
+LOG_DIR="/var/log/airlock"
+LOG_FILE="$LOG_DIR/airlock.log"
+PID_FILE="/tmp/airlock_monitor.pid"
+WATCHDOG_PID="/tmp/airlock_watchdog.pid"
+DNS_BACKUP="/etc/resolv.conf.airlock.bak"
+IPTABLES_BACKUP="/tmp/airlock_iptables.bak"
+IP6TABLES_BACKUP="/tmp/airlock_ip6tables.bak"
+MODPROBE_CONF="/etc/modprobe.d/airlock-block.conf"
+UDEV_RULE="/etc/udev/rules.d/99-airlock-block-usb-net.rules"
+
+# Feature flags
+PARANOID_MODE=false      # Unload kernel modules
+VAULT_MODE=false         # Maximum isolation (USB block, process kill, etc.)
+WATCHDOG_ENABLED=false   # Auto-restore after timeout
+WATCHDOG_TIMEOUT=300     # 5 minutes default
+
+# Network processes to terminate in vault mode
+NETWORK_PROCESSES="NetworkManager wpa_supplicant dhcpcd dhclient connmand wicd-daemon openvpn wireguard"
+
+# Colors
+RED='\033[1;31m'
+GREEN='\033[1;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[1;34m'
+CYAN='\033[1;36m'
+MAGENTA='\033[1;35m'
+WHITE='\033[1;37m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+BG_RED='\033[41m'
+BG_GREEN='\033[42m'
+BG_YELLOW='\033[43m'
+BG_BLUE='\033[44m'
+BG_CYAN='\033[46m'
+
+# === Banner ===
+show_banner() {
+    echo -e "${CYAN}"
+    cat << 'EOF'
+
+   ________   ________  ________  _______   ________  ________  ____ ___
+  /        \ /        \/        \/       \ /        \/        \/    /   \
+ /         /_/       //         /        //         /         /         /
+/         //         /        _/        //         /       --/        _/
+\___/____/ \________/\____/___/\________/\________/\________/\____/___/ 
+                                          
+EOF
+    echo -e "${RESET}"
+    echo -e "  ${BOLD}Airlock - Software Based Sudo Airgap Utility v${VERSION}${RESET}"
+    echo -e "  ${DIM}Seal your system from the network${RESET}"
+    echo ""
+}
+
+# === Compact Banner for Help ===
+show_banner_compact() {
+    echo -e "${CYAN}"
+    cat << 'EOF'
+   ________   ________  ________  _______   ________  ________  ____ ___
+  /        \ /        \/        \/       \ /        \/        \/    /   \
+ /         /_/       //         /        //         /         /         /
+/         //         /        _/        //         /       --/        _/
+\___/____/ \________/\____/___/\________/\________/\________/\____/___/ 
+EOF
+    echo -e "${RESET}"
+    echo -e "  ${BOLD}Airlock 🔒 - Software Based Sudo Airgap Utility v${VERSION}${RESET}"
+    echo -e "  ${DIM}Seal your system from the network${RESET}"
+}
+
+# === Logging ===
+setup_logging() {
+    mkdir -p "$LOG_DIR"
+    touch "$LOG_FILE"
+    chmod 600 "$LOG_FILE"
+}
+
+log() { 
+    local msg="$1"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo -e "[${BOLD}${PROGRAM_NAME}${RESET}] $msg"
+    echo "[$timestamp] $msg" >> "$LOG_FILE" 2>/dev/null
+}
+
+log_success() { 
+    local msg="$1"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo -e "[${GREEN}${PROGRAM_NAME}${RESET}] ${GREEN}✓ $msg${RESET}"
+    echo "[$timestamp] SUCCESS: $msg" >> "$LOG_FILE" 2>/dev/null
+}
+
+log_error() { 
+    local msg="$1"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo -e "[${RED}${PROGRAM_NAME}${RESET}] ${RED}✗ $msg${RESET}"
+    echo "[$timestamp] ERROR: $msg" >> "$LOG_FILE" 2>/dev/null
+}
+
+log_warn() { 
+    local msg="$1"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo -e "[${YELLOW}${PROGRAM_NAME}${RESET}] ${YELLOW}⚠ $msg${RESET}"
+    echo "[$timestamp] WARN: $msg" >> "$LOG_FILE" 2>/dev/null
+}
+
+log_info() { 
+    local msg="$1"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo -e "[${BLUE}${PROGRAM_NAME}${RESET}] ${BLUE}ℹ $msg${RESET}"
+    echo "[$timestamp] INFO: $msg" >> "$LOG_FILE" 2>/dev/null
+}
+
+# === Dependency Checks ===
+check_dependencies() {
+    local missing=()
+    
+    command -v ip >/dev/null 2>&1 || missing+=("iproute2")
+    command -v iptables >/dev/null 2>&1 || missing+=("iptables")
+    
+    if ! command -v rfkill >/dev/null 2>&1; then
+        log_warn "rfkill not found - wireless radio control unavailable"
+    fi
+    
+    if [ ${#missing[@]} -gt 0 ]; then
+        log_error "Missing required dependencies: ${missing[*]}"
+        log_error "Install with: xbps-install -S ${missing[*]}"
+        exit 1
+    fi
+}
+
+# === Init System Detection ===
+detect_init_system() {
+    if [ -d /run/runit ]; then
+        echo "runit"
+    elif command -v systemctl >/dev/null 2>&1 && systemctl --version >/dev/null 2>&1; then
+        echo "systemd"
+    elif command -v rc-service >/dev/null 2>&1; then
+        echo "openrc"
+    else
+        echo "unknown"
+    fi
+}
+
+INIT_SYSTEM=$(detect_init_system)
+
+# === State Management ===
+save_state() {
+    mkdir -p "$(dirname "$STATE_FILE")"
+    cat > "$STATE_FILE" << EOF
+STATUS=SEALED
+TIMESTAMP=$(date -u +%s)
+PARANOID=$PARANOID_MODE
+VAULT=$VAULT_MODE
+MODULES=$NIC_MODULES
+INIT=$INIT_SYSTEM
+EOF
+    chmod 600 "$STATE_FILE"
+}
+
+clear_state() {
+    rm -f "$STATE_FILE"
+}
+
+check_state() {
+    [ -f "$STATE_FILE" ] && grep -q "STATUS=SEALED" "$STATE_FILE"
+}
+
+get_activation_time() {
+    if [ -f "$STATE_FILE" ]; then
+        local ts=$(grep "TIMESTAMP=" "$STATE_FILE" | cut -d= -f2)
+        local now=$(date -u +%s)
+        local diff=$((now - ts))
+        
+        if [ "$diff" -lt 60 ]; then
+            echo "${diff}s ago"
+        elif [ "$diff" -lt 3600 ]; then
+            echo "$((diff / 60))m $((diff % 60))s ago"
+        else
+            echo "$((diff / 3600))h $((diff % 3600 / 60))m ago"
+        fi
+    fi
+}
+
+# === NIC Module Detection ===
+detect_nics() {
+    NIC_MODULES=$(lsmod | awk '/(e1000|iwl|r8169|ath|realtek|usbnet|8139|broadcom|virtio|xen_netfront|r8152|igb|ixgbe|rtl|mt7|rtw|brcm|cdc_ncm|cdc_ether|rndis)/ {print $1}' | sort -u | tr '\n' ' ')
+    if [ -z "$NIC_MODULES" ]; then
+        for iface in /sys/class/net/*; do
+            [ -d "$iface/device/driver/module" ] && {
+                mod=$(basename "$(readlink -f "$iface/device/driver/module")")
+                NIC_MODULES="$NIC_MODULES $mod"
+            }
+        done
+        NIC_MODULES=$(echo "$NIC_MODULES" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+    fi
+    [ -n "$NIC_MODULES" ] && log "Detected NIC modules: $NIC_MODULES"
+}
+
+# === DNS Management ===
+flush_dns() {
+    if [ -f /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ]; then
+        cp /etc/resolv.conf "$DNS_BACKUP"
+    elif [ -L /etc/resolv.conf ]; then
+        cp -L /etc/resolv.conf "$DNS_BACKUP"
+    fi
+    
+    if command -v resolvectl >/dev/null 2>&1; then
+        resolvectl flush-caches 2>/dev/null
+    elif command -v systemd-resolve >/dev/null 2>&1; then
+        systemd-resolve --flush-caches 2>/dev/null
+    fi
+    
+    # Also clear nscd if present
+    command -v nscd >/dev/null 2>&1 && nscd -i hosts 2>/dev/null
+    
+    if [ -L /etc/resolv.conf ]; then
+        rm -f /etc/resolv.conf
+        touch /etc/resolv.conf
+    else
+        : > /etc/resolv.conf
+    fi
+    
+    log "DNS flushed and resolvers disabled."
+}
+
+restore_dns() {
+    if [ -f "$DNS_BACKUP" ]; then
+        rm -f /etc/resolv.conf 2>/dev/null
+        mv "$DNS_BACKUP" /etc/resolv.conf
+        log "DNS configuration restored."
+    else
+        log_warn "No DNS backup found - using fallback."
+        echo "nameserver 1.1.1.1" > /etc/resolv.conf
+    fi
+}
+
+# === Enhanced Firewall Control ===
+enable_firewall_block() {
+    iptables-save > "$IPTABLES_BACKUP" 2>/dev/null
+    ip6tables-save > "$IP6TABLES_BACKUP" 2>/dev/null
+
+    # IPv4: Comprehensive blocking
+    iptables -I OUTPUT 1 -o lo -j ACCEPT 2>/dev/null
+    iptables -I OUTPUT 2 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+    iptables -I OUTPUT 3 -j LOG --log-prefix "AIRLOCK_BLOCKED: " --log-level 4 2>/dev/null
+    iptables -I OUTPUT 4 -j DROP 2>/dev/null
+    
+    # Also block INPUT (except loopback and established)
+    iptables -I INPUT 1 -i lo -j ACCEPT 2>/dev/null
+    iptables -I INPUT 2 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+    iptables -I INPUT 3 -j DROP 2>/dev/null
+    
+    # Block FORWARD
+    iptables -I FORWARD 1 -j DROP 2>/dev/null
+    
+    # IPv6: Same treatment
+    ip6tables -I OUTPUT 1 -o lo -j ACCEPT 2>/dev/null
+    ip6tables -I OUTPUT 2 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+    ip6tables -I OUTPUT 3 -j LOG --log-prefix "AIRLOCK_BLOCKED: " --log-level 4 2>/dev/null
+    ip6tables -I OUTPUT 4 -j DROP 2>/dev/null
+    
+    ip6tables -I INPUT 1 -i lo -j ACCEPT 2>/dev/null
+    ip6tables -I INPUT 2 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+    ip6tables -I INPUT 3 -j DROP 2>/dev/null
+    
+    ip6tables -I FORWARD 1 -j DROP 2>/dev/null
+    
+    # Block specific ports that might bypass (DNS, DHCP)
+    iptables -I OUTPUT 1 -p udp --dport 53 -j DROP 2>/dev/null
+    iptables -I OUTPUT 1 -p tcp --dport 53 -j DROP 2>/dev/null
+    iptables -I OUTPUT 1 -p udp --dport 67:68 -j DROP 2>/dev/null
+    
+    log "Firewall: All traffic blocked (INPUT/OUTPUT/FORWARD)."
+}
+
+disable_firewall_block() {
+    # Remove OUTPUT rules
+    iptables -D OUTPUT -j DROP 2>/dev/null
+    iptables -D OUTPUT -j LOG --log-prefix "AIRLOCK_BLOCKED: " --log-level 4 2>/dev/null
+    iptables -D OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+    iptables -D OUTPUT -o lo -j ACCEPT 2>/dev/null
+    iptables -D OUTPUT -p udp --dport 53 -j DROP 2>/dev/null
+    iptables -D OUTPUT -p tcp --dport 53 -j DROP 2>/dev/null
+    iptables -D OUTPUT -p udp --dport 67:68 -j DROP 2>/dev/null
+    
+    # Remove INPUT rules
+    iptables -D INPUT -j DROP 2>/dev/null
+    iptables -D INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+    iptables -D INPUT -i lo -j ACCEPT 2>/dev/null
+    
+    # Remove FORWARD rules
+    iptables -D FORWARD -j DROP 2>/dev/null
+    
+    # IPv6
+    ip6tables -D OUTPUT -j DROP 2>/dev/null
+    ip6tables -D OUTPUT -j LOG --log-prefix "AIRLOCK_BLOCKED: " --log-level 4 2>/dev/null
+    ip6tables -D OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+    ip6tables -D OUTPUT -o lo -j ACCEPT 2>/dev/null
+    
+    ip6tables -D INPUT -j DROP 2>/dev/null
+    ip6tables -D INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+    ip6tables -D INPUT -i lo -j ACCEPT 2>/dev/null
+    
+    ip6tables -D FORWARD -j DROP 2>/dev/null
+    
+    log "Firewall: Restrictions removed."
+}
+
+# === Wireless Radio Control ===
+disable_radios() {
+    if command -v rfkill >/dev/null 2>&1; then
+        rfkill block all 2>/dev/null
+        log "Wireless radios blocked via rfkill."
+    fi
+}
+
+enable_radios() {
+    if command -v rfkill >/dev/null 2>&1; then
+        rfkill unblock all 2>/dev/null
+        log "Wireless radios unblocked."
+    fi
+}
+
+# === Routing Control ===
+enable_blackhole() {
+    ip route show default > /tmp/airlock_default_route.bak 2>/dev/null
+    
+    ip route replace blackhole 0.0.0.0/0 metric 1 2>/dev/null
+    ip -6 route replace blackhole ::/0 metric 1 2>/dev/null
+    
+    # Also disable IPv6 at sysctl level
+    sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1
+    sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1
+    
+    log "Blackhole routing activated, IPv6 disabled."
+}
+
+disable_blackhole() {
+    ip route del blackhole 0.0.0.0/0 2>/dev/null
+    ip -6 route del blackhole ::/0 2>/dev/null
+    
+    # Re-enable IPv6
+    sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
+    sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1
+    
+    log "Blackhole routing removed, IPv6 re-enabled."
+}
+
+# === Interface Management ===
+down_interfaces() {
+    for iface in /sys/class/net/*; do
+        [ -d "$iface" ] || continue
+        local name=$(basename "$iface")
+        [ "$name" = "lo" ] && continue
+        
+        ip link set "$name" down 2>/dev/null && log "Interface down: $name"
+    done
+}
+
+up_interfaces() {
+    for iface in /sys/class/net/*; do
+        [ -d "$iface" ] || continue
+        local name=$(basename "$iface")
+        [ "$name" = "lo" ] && continue
+        
+        ip link set "$name" up 2>/dev/null && log "Interface up: $name"
+    done
+}
+
+# === USB Network Device Blocking (Vault Mode) ===
+block_usb_network() {
+    [ "$VAULT_MODE" != "true" ] && return
+    
+    # Create udev rule to block USB network devices
+    cat > "$UDEV_RULE" << 'EOF'
+# Airlock: Block USB network devices
+ACTION=="add", SUBSYSTEM=="net", DRIVERS=="usb", RUN+="/bin/sh -c 'echo 0 > /sys$DEVPATH/authorized'"
+ACTION=="add", ATTR{bInterfaceClass}=="02", ATTR{bInterfaceSubClass}=="06", RUN+="/bin/sh -c 'echo 0 > /sys$DEVPATH/../authorized'"
+ACTION=="add", ATTR{bInterfaceClass}=="02", ATTR{bInterfaceSubClass}=="0d", RUN+="/bin/sh -c 'echo 0 > /sys$DEVPATH/../authorized'"
+ACTION=="add", ATTR{bInterfaceClass}=="e0", ATTR{bInterfaceSubClass}=="01", RUN+="/bin/sh -c 'echo 0 > /sys$DEVPATH/../authorized'"
+EOF
+    
+    # Reload udev rules
+    udevadm control --reload-rules 2>/dev/null
+    
+    # Disable existing USB network devices
+    for dev in /sys/bus/usb/devices/*/net/*; do
+        [ -d "$dev" ] && {
+            local usb_dev=$(dirname "$(dirname "$dev")")
+            echo 0 > "$usb_dev/authorized" 2>/dev/null
+        }
+    done
+    
+    log "USB network devices blocked."
+}
+
+unblock_usb_network() {
+    # Remove udev rule
+    rm -f "$UDEV_RULE" 2>/dev/null
+    udevadm control --reload-rules 2>/dev/null
+    
+    # Re-authorize USB devices
+    for dev in /sys/bus/usb/devices/*/authorized; do
+        echo 1 > "$dev" 2>/dev/null
+    done
+    
+    log "USB network devices unblocked."
+}
+
+# === Module Loading Prevention (Vault Mode) ===
+prevent_module_loading() {
+    [ "$VAULT_MODE" != "true" ] && return
+    
+    # Create modprobe blacklist for network modules
+    cat > "$MODPROBE_CONF" << EOF
+# Airlock: Prevent network module loading
+install e1000 /bin/false
+install e1000e /bin/false
+install iwlwifi /bin/false
+install iwlmvm /bin/false
+install r8169 /bin/false
+install r8152 /bin/false
+install ath9k /bin/false
+install ath10k_pci /bin/false
+install rtl8xxxu /bin/false
+install rtw88_pci /bin/false
+install mt7921e /bin/false
+install brcmfmac /bin/false
+install virtio_net /bin/false
+install xen_netfront /bin/false
+install usbnet /bin/false
+install cdc_ether /bin/false
+install cdc_ncm /bin/false
+install rndis_host /bin/false
+EOF
+    
+    log "Network module loading prevented."
+}
+
+allow_module_loading() {
+    rm -f "$MODPROBE_CONF" 2>/dev/null
+    log "Network module loading allowed."
+}
+
+# === Network Process Termination (Vault Mode) ===
+kill_network_processes() {
+    [ "$VAULT_MODE" != "true" ] && return
+    
+    for proc in $NETWORK_PROCESSES; do
+        if pgrep -x "$proc" >/dev/null 2>&1; then
+            pkill -TERM -x "$proc" 2>/dev/null
+            sleep 0.5
+            pkill -KILL -x "$proc" 2>/dev/null
+            log "Terminated: $proc"
+        fi
+    done
+}
+
+# === Memory Sanitization (Vault Mode) ===
+sanitize_memory() {
+    [ "$VAULT_MODE" != "true" ] && return
+    
+    # Clear clipboard (X11)
+    if command -v xclip >/dev/null 2>&1; then
+        echo -n | xclip -selection clipboard 2>/dev/null
+        echo -n | xclip -selection primary 2>/dev/null
+        log "X11 clipboard cleared."
+    fi
+    
+    # Clear clipboard (Wayland)
+    if command -v wl-copy >/dev/null 2>&1; then
+        wl-copy --clear 2>/dev/null
+        log "Wayland clipboard cleared."
+    fi
+    
+    # Drop filesystem caches (frees some network-related cached data)
+    sync
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+    
+    # Clear bash history for current session (network commands)
+    history -c 2>/dev/null
+    
+    log "Memory sanitization completed."
+}
+
+# === DHCP Restart ===
+restart_dhcp() {
+    sleep 2
+    
+    case "$INIT_SYSTEM" in
+        runit)
+            if sv check dhcpcd >/dev/null 2>&1; then
+                sv restart dhcpcd 2>/dev/null && log "DHCP restarted via runit."
+                return
+            fi
+            ;;
+        systemd)
+            if systemctl is-active NetworkManager >/dev/null 2>&1; then
+                systemctl restart NetworkManager 2>/dev/null && log "NetworkManager restarted."
+                return
+            elif systemctl is-active systemd-networkd >/dev/null 2>&1; then
+                systemctl restart systemd-networkd 2>/dev/null && log "systemd-networkd restarted."
+                return
+            elif systemctl is-active dhcpcd >/dev/null 2>&1; then
+                systemctl restart dhcpcd 2>/dev/null && log "dhcpcd restarted via systemd."
+                return
+            fi
+            ;;
+        openrc)
+            if rc-service dhcpcd status >/dev/null 2>&1; then
+                rc-service dhcpcd restart 2>/dev/null && log "dhcpcd restarted via OpenRC."
+                return
+            fi
+            ;;
+    esac
+    
+    if command -v dhcpcd >/dev/null 2>&1; then
+        pkill dhcpcd 2>/dev/null
+        sleep 1
+        dhcpcd 2>/dev/null &
+        log "DHCP client started manually."
+    elif command -v dhclient >/dev/null 2>&1; then
+        pkill dhclient 2>/dev/null
+        sleep 1
+        dhclient 2>/dev/null &
+        log "dhclient started manually."
+    fi
+}
+
+# === Module Control (Paranoid Mode) ===
+unload_modules() {
+    [ "$PARANOID_MODE" != "true" ] && return
+    
+    for mod in $NIC_MODULES; do
+        [ -z "$mod" ] && continue
+        if modprobe -r "$mod" 2>/dev/null; then
+            log "Unloaded module: $mod"
+        else
+            log_warn "Could not unload: $mod (may be in use)"
+        fi
+    done
+}
+
+reload_modules() {
+    [ "$PARANOID_MODE" != "true" ] && return
+    [ -z "$NIC_MODULES" ] && return
+    
+    for mod in $NIC_MODULES; do
+        [ -z "$mod" ] && continue
+        if modprobe "$mod" 2>/dev/null; then
+            log "Reloaded module: $mod"
+        else
+            log_warn "Could not reload: $mod"
+        fi
+    done
+    
+    udevadm trigger --subsystem-match=net 2>/dev/null
+    udevadm settle 2>/dev/null
+}
+
+# === Network Cache Clearing ===
+clear_network_cache() {
+    ip neigh flush all 2>/dev/null
+    ip route flush cache 2>/dev/null
+    
+    # Clear connection tracking
+    command -v conntrack >/dev/null 2>&1 && conntrack -F 2>/dev/null
+    
+    log "Network caches cleared (ARP, routing, conntrack)."
+}
+
+# === Watchdog ===
+start_watchdog() {
+    [ "$WATCHDOG_ENABLED" != "true" ] && return
+    
+    (
+        sleep "$WATCHDOG_TIMEOUT"
+        if check_state; then
+            log_warn "Watchdog triggered - auto-unsealing after ${WATCHDOG_TIMEOUT}s"
+            airlock_unseal
+        fi
+    ) &
+    echo $! > "$WATCHDOG_PID"
+    log "Watchdog armed: auto-unseal in ${WATCHDOG_TIMEOUT}s"
+}
+
+stop_watchdog() {
+    if [ -f "$WATCHDOG_PID" ]; then
+        kill "$(cat "$WATCHDOG_PID")" 2>/dev/null
+        rm -f "$WATCHDOG_PID"
+    fi
+}
+
+# === Traffic Monitor ===
+start_monitor_logging() {
+    mkdir -p "$LOG_DIR"
+    dmesg -w 2>/dev/null | grep --line-buffered "AIRLOCK_BLOCKED" >> "$LOG_DIR/blocked.log" &
+    echo $! > "$PID_FILE"
+}
+
+stop_monitor_logging() {
+    if [ -f "$PID_FILE" ]; then
+        kill "$(cat "$PID_FILE")" 2>/dev/null
+        rm -f "$PID_FILE"
+    fi
+}
+
+# === Connectivity Test ===
+test_connectivity() {
+    for target in 1.1.1.1 8.8.8.8 9.9.9.9; do
+        if ping -c 1 -W 2 "$target" >/dev/null 2>&1; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# === Force Repair ===
+force_repair() {
+    log "Running network repair..."
+    
+    # Remove any blocking configurations
+    allow_module_loading
+    unblock_usb_network
+    
+    if [ -f "$STATE_FILE" ] && grep -q "PARANOID=true" "$STATE_FILE"; then
+        PARANOID_MODE=true
+        # Read saved modules from state file (detection won't work if unloaded)
+        NIC_MODULES=$(grep "MODULES=" "$STATE_FILE" | cut -d= -f2)
+        if [ -z "$NIC_MODULES" ]; then
+            log_warn "No saved modules, attempting PCI rescan first..."
+            echo 1 > /sys/bus/pci/rescan 2>/dev/null
+            sleep 1
+            detect_nics
+        else
+            log "Restoring saved modules: $NIC_MODULES"
+        fi
+        reload_modules
+    fi
+    
+    echo 1 > /sys/bus/pci/rescan 2>/dev/null
+    udevadm trigger --subsystem-match=net 2>/dev/null
+    udevadm settle 2>/dev/null
+    
+    up_interfaces
+    restore_dns
+    restart_dhcp
+    
+    sleep 3
+    
+    if test_connectivity; then
+        log_success "Network connectivity restored."
+    else
+        log_error "Could not restore connectivity automatically."
+        log "Try: ip addr / ip route / cat /etc/resolv.conf"
+    fi
+}
+
+# === Main Functions ===
+airlock_seal() {
+    if check_state; then
+        log_warn "Airlock is already sealed! ($(get_activation_time))"
+        return 1
+    fi
+    
+    setup_logging
+    detect_nics
+    
+    echo ""
+    log "Sealing airlock..."
+    [ "$PARANOID_MODE" = "true" ] && log_warn "Paranoid mode: kernel modules will be unloaded"
+    [ "$VAULT_MODE" = "true" ] && log_warn "Vault mode: maximum isolation enabled"
+    echo ""
+    
+    # === Isolation Sequence ===
+    
+    # Layer 1: Kill network processes (vault)
+    kill_network_processes
+    
+    # Layer 2: Block wireless radios
+    disable_radios
+    
+    # Layer 3: Flush DNS
+    flush_dns
+    
+    # Layer 4: Firewall block (primary)
+    enable_firewall_block
+    
+    # Layer 5: Blackhole routing + disable IPv6
+    enable_blackhole
+    
+    # Layer 6: Interface down
+    down_interfaces
+    
+    # Layer 7: Module unload (paranoid)
+    unload_modules
+    
+    # Layer 8: Prevent module loading (vault)
+    prevent_module_loading
+    
+    # Layer 9: Block USB network devices (vault)
+    block_usb_network
+    
+    # Layer 10: Clear caches
+    clear_network_cache
+    
+    # Layer 11: Memory sanitization (vault)
+    sanitize_memory
+    
+    # Start monitoring
+    start_monitor_logging
+    
+    # Start watchdog
+    start_watchdog
+    
+    # Save state
+    save_state
+    
+    echo ""
+    if [ "$VAULT_MODE" = "true" ]; then
+        # Yellow/Black hazard stripes for VAULT (maximum warning)
+        echo -e "\033[30;43m░▒▓█▓▒░▓▒░█▓▒░▓▒░█▓▒░▓▒░█▓▒░▓▒░█▓▒░▓▒░█▓▒░▓▒░█▓▒░▓▒░█▓▒░\033[0m"
+        echo -e "\033[30;43m▓▒░                                                    ░▒▓\033[0m"
+        echo -e "\033[30;43m█▓▒\033[0m\033[93;40m       VAULT MODE - MAXIMUM ISOLATION          \033[0m\033[30;43m▒▓█\033[0m"
+        echo -e "\033[30;43m▓▒░                                                    ░▒▓\033[0m"
+        echo -e "\033[30;43m░▒▓█▓▒░▓▒░█▓▒░▓▒░█▓▒░▓▒░█▓▒░▓▒░█▓▒░▓▒░█▓▒░▓▒░█▓▒░▓▒░█▓▒░\033[0m"
+    else
+        # Red hazard stripes for standard AIRLOCK seal
+        echo -e "\033[30;41m░▒▓█▓▒░▓▒░█▓▒░▓▒░█▓▒░▓▒░█▓▒░▓▒░█▓▒░▓▒░█▓▒░▓▒░█▓▒░▓▒░█▓▒░\033[0m"
+        echo -e "\033[30;41m▓▒░                                                    ░▒▓\033[0m"
+        echo -e "\033[30;41m█▓▒\033[0m\033[91;40m       AIRLOCK SEALED - NETWORK BLOCKED        \033[0m\033[30;41m▒▓█\033[0m"
+        echo -e "\033[30;41m▓▒░                                                    ░▒▓\033[0m"
+        echo -e "\033[30;41m░▒▓█▓▒░▓▒░█▓▒░▓▒░█▓▒░▓▒░█▓▒░▓▒░█▓▒░▓▒░█▓▒░▓▒░█▓▒░▓▒░█▓▒░\033[0m"
+    fi
+    echo ""
+    log "Run 'airlock unseal' to restore network"
+    [ "$WATCHDOG_ENABLED" = "true" ] && log "Watchdog: auto-unseal in ${WATCHDOG_TIMEOUT}s"
+    echo ""
+}
+
+airlock_unseal() {
+    if ! check_state; then
+        log_warn "Airlock does not appear to be sealed."
+        log "Running recovery anyway..."
+    fi
+    
+    echo ""
+    log "Unsealing airlock..."
+    echo ""
+    
+    stop_watchdog
+    stop_monitor_logging
+    
+    # Check if vault mode was used
+    local was_vault=false
+    [ -f "$STATE_FILE" ] && grep -q "VAULT=true" "$STATE_FILE" && was_vault=true
+    
+    # Check if paranoid mode was used and restore saved module list
+    if [ -f "$STATE_FILE" ] && grep -q "PARANOID=true" "$STATE_FILE"; then
+        PARANOID_MODE=true
+        # CRITICAL: Read saved modules from state file, not detect_nics
+        # Because modules are unloaded, detection would fail
+        NIC_MODULES=$(grep "MODULES=" "$STATE_FILE" | cut -d= -f2)
+        if [ -z "$NIC_MODULES" ]; then
+            log_warn "No saved modules found, attempting detection..."
+            detect_nics
+        else
+            log "Restoring saved modules: $NIC_MODULES"
+        fi
+    fi
+    
+    # === Restore Sequence ===
+    
+    # Remove vault mode blocks
+    if [ "$was_vault" = "true" ]; then
+        allow_module_loading
+        unblock_usb_network
+    fi
+    
+    # Reload modules
+    reload_modules
+    
+    # Remove blackhole routes, re-enable IPv6
+    disable_blackhole
+    
+    # Remove firewall blocks
+    disable_firewall_block
+    
+    # Bring interfaces up
+    up_interfaces
+    
+    # Unblock radios
+    enable_radios
+    
+    # Restore DNS
+    restore_dns
+    
+    # Restart DHCP
+    restart_dhcp
+    
+    # Clear state
+    clear_state
+    
+    sleep 2
+    echo ""
+    
+    if test_connectivity; then
+        # Green hazard stripes for UNSEALED (safe)
+        echo -e "\033[30;42m░▒▓█▓▒░▓▒░█▓▒░▓▒░█▓▒░▓▒░█▓▒░▓▒░█▓▒░▓▒░█▓▒░▓▒░█▓▒░▓▒░█▓▒░\033[0m"
+        echo -e "\033[30;42m▓▒░                                                    ░▒▓\033[0m"
+        echo -e "\033[30;42m█▓▒\033[0m\033[92;40m     ✓  UNSEALED - NETWORK RESTORED  ✓            \033[0m\033[30;42m▒▓█\033[0m"
+        echo -e "\033[30;42m▓▒░                                                    ░▒▓\033[0m"
+        echo -e "\033[30;42m░▒▓█▓▒░▓▒░█▓▒░▓▒░█▓▒░▓▒░█▓▒░▓▒░█▓▒░▓▒░█▓▒░▓▒░█▓▒░▓▒░█▓▒░\033[0m"
+    else
+        log_error "Connectivity test failed - attempting repair..."
+        force_repair
+    fi
+    echo ""
+}
+
+# === Status Display ===
+status_check() {
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════${RESET}"
+    echo -e "${BOLD}${WHITE}                   AIRLOCK STATUS                      ${RESET}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════${RESET}"
+    echo ""
+    
+    if check_state; then
+        echo -e "  Status:     ${RED}██ SEALED${RESET} - All network blocked"
+        echo -e "  Sealed:     $(get_activation_time)"
+        grep -q "PARANOID=true" "$STATE_FILE" && echo -e "  Mode:       ${YELLOW}Paranoid (modules unloaded)${RESET}"
+        grep -q "VAULT=true" "$STATE_FILE" && echo -e "  Mode:       ${MAGENTA}Vault (maximum isolation)${RESET}"
+    else
+        echo -e "  Status:     ${GREEN}██ UNSEALED${RESET} - Network available"
+    fi
+    
+    echo ""
+    echo -e "${BOLD}─── Interfaces ───${RESET}"
+    ip -br link show | grep -v "^lo" | while read -r line; do
+        if echo "$line" | grep -q "UP"; then
+            echo -e "  ${GREEN}●${RESET} $line"
+        else
+            echo -e "  ${RED}○${RESET} $line"
+        fi
+    done
+    
+    echo ""
+    echo -e "${BOLD}─── IP Addresses ───${RESET}"
+    ip -br addr show | grep -v "^lo" | grep -v "^$" | sed 's/^/  /' || echo -e "  ${DIM}(none)${RESET}"
+    
+    echo ""
+    echo -e "${BOLD}─── Default Route ───${RESET}"
+    local route=$(ip route show default 2>/dev/null)
+    if [ -n "$route" ]; then
+        echo -e "  ${GREEN}●${RESET} $route"
+    elif ip route | grep -q blackhole; then
+        echo -e "  ${RED}●${RESET} BLACKHOLE - all traffic dropped"
+    else
+        echo -e "  ${YELLOW}○${RESET} No default route"
+    fi
+    
+    echo ""
+    echo -e "${BOLD}─── DNS ───${RESET}"
+    if [ -s /etc/resolv.conf ]; then
+        grep "^nameserver" /etc/resolv.conf | head -3 | while read -r line; do
+            echo -e "  ${GREEN}●${RESET} $line"
+        done
+    else
+        echo -e "  ${RED}○${RESET} DNS disabled"
+    fi
+    
+    echo ""
+    echo -e "${BOLD}─── Wireless Radios ───${RESET}"
+    if command -v rfkill >/dev/null 2>&1; then
+        rfkill list 2>/dev/null | grep -E "blocked" | while read -r line; do
+            if echo "$line" | grep -q "yes"; then
+                echo -e "  ${RED}●${RESET} $line"
+            else
+                echo -e "  ${GREEN}●${RESET} $line"
+            fi
+        done
+    else
+        echo -e "  ${DIM}(rfkill not available)${RESET}"
+    fi
+    
+    echo ""
+    echo -e "${BOLD}─── Firewall ───${RESET}"
+    if iptables -L OUTPUT -n 2>/dev/null | grep -q "AIRLOCK\|DROP"; then
+        echo -e "  ${RED}●${RESET} OUTPUT: Blocking"
+    else
+        echo -e "  ${GREEN}●${RESET} OUTPUT: Normal"
+    fi
+    if iptables -L INPUT -n 2>/dev/null | grep -q "DROP"; then
+        echo -e "  ${RED}●${RESET} INPUT: Blocking"
+    else
+        echo -e "  ${GREEN}●${RESET} INPUT: Normal"
+    fi
+    
+    echo ""
+    echo -e "${BOLD}─── Vault Mode Status ───${RESET}"
+    if [ -f "$MODPROBE_CONF" ]; then
+        echo -e "  ${RED}●${RESET} Module loading: Blocked"
+    else
+        echo -e "  ${GREEN}●${RESET} Module loading: Allowed"
+    fi
+    if [ -f "$UDEV_RULE" ]; then
+        echo -e "  ${RED}●${RESET} USB network: Blocked"
+    else
+        echo -e "  ${GREEN}●${RESET} USB network: Allowed"
+    fi
+    
+    if check_state && [ -f "$LOG_DIR/blocked.log" ]; then
+        local blocked_count=$(wc -l < "$LOG_DIR/blocked.log" 2>/dev/null || echo 0)
+        if [ "$blocked_count" -gt 0 ]; then
+            echo ""
+            echo -e "${BOLD}─── Blocked Attempts ───${RESET}"
+            echo -e "  ${YELLOW}$blocked_count${RESET} connection attempts blocked"
+        fi
+    fi
+    
+    echo ""
+}
+
+# === Live Traffic Monitor ===
+monitor_traffic() {
+    log "Starting live traffic monitor..."
+    echo ""
+    echo -e "${BOLD}Blocked connection attempts:${RESET}"
+    echo -e "${DIM}Press Ctrl+C to stop${RESET}"
+    echo ""
+    printf "${BOLD}%-10s %-15s %-15s %-7s %-7s %-6s${RESET}\n" "TIME" "SOURCE" "DEST" "SPORT" "DPORT" "PROTO"
+    echo "─────────────────────────────────────────────────────────────────"
+    
+    dmesg -w 2>/dev/null | grep --line-buffered "AIRLOCK_BLOCKED" | while read -r line; do
+        local src=$(echo "$line" | grep -oP 'SRC=\K[0-9.]+')
+        local dst=$(echo "$line" | grep -oP 'DST=\K[0-9.]+')
+        local spt=$(echo "$line" | grep -oP 'SPT=\K[0-9]+')
+        local dpt=$(echo "$line" | grep -oP 'DPT=\K[0-9]+')
+        local proto=$(echo "$line" | grep -oP 'PROTO=\K[A-Z]+')
+        local time=$(date '+%H:%M:%S')
+        
+        printf "${RED}%-10s${RESET} %-15s %-15s %-7s %-7s %-6s\n" "$time" "$src" "$dst" "$spt" "$dpt" "$proto"
+    done
+}
+
+# === View Blocked Log ===
+view_blocked_log() {
+    echo ""
+    if [ -f "$LOG_DIR/blocked.log" ] && [ -s "$LOG_DIR/blocked.log" ]; then
+        echo -e "${BOLD}Blocked Connection Summary${RESET}"
+        echo ""
+        
+        printf "${BOLD}%-8s %-15s %-15s${RESET}\n" "COUNT" "SOURCE" "DESTINATION"
+        echo "─────────────────────────────────────────"
+        
+        grep -oP 'SRC=\K[0-9.]+|DST=\K[0-9.]+' "$LOG_DIR/blocked.log" | \
+            paste - - | sort | uniq -c | sort -rn | head -20 | \
+            while read -r count src dst; do
+                printf "%-8s %-15s %-15s\n" "$count" "$src" "$dst"
+            done
+        
+        echo ""
+        local total=$(wc -l < "$LOG_DIR/blocked.log")
+        echo -e "Total: ${YELLOW}$total${RESET} blocked attempts"
+    else
+        log "No blocked connections logged."
+    fi
+    echo ""
+}
+
+# === Clear Logs ===
+clear_logs() {
+    rm -f "$LOG_DIR/blocked.log"
+    : > "$LOG_FILE"
+    log_success "Logs cleared."
+}
+
+# === Enhanced Help Display ===
+show_help() {
+    show_banner_compact
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════════════${RESET}"
+    echo -e "${BOLD}${WHITE}                              HELP & FAQ                               ${RESET}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════════════${RESET}"
+    echo ""
+    
+    # What is Airlock?
+    echo -e "  ${BOLD}${CYAN}WHAT IS AIRLOCK?${RESET}"
+    echo -e "  ─────────────────────────────────────────────────────────────────"
+    echo -e "  Airlock is a software-based \"airgap\" utility that provides layered"
+    echo -e "  network isolation for Linux systems. Unlike a true hardware airgap,"
+    echo -e "  Airlock creates a ${BOLD}software-enforced${RESET} barrier between your system and"
+    echo -e "  any network, useful for sensitive operations, malware analysis,"
+    echo -e "  or privacy-critical tasks."
+    echo ""
+    
+    # Why use it?
+    echo -e "  ${BOLD}${CYAN}WHY USE AIRLOCK?${RESET}"
+    echo -e "  ─────────────────────────────────────────────────────────────────"
+    echo -e "  ${GREEN}•${RESET} ${BOLD}Incident Response${RESET}    - Isolate compromised systems instantly"
+    echo -e "  ${GREEN}•${RESET} ${BOLD}Malware Analysis${RESET}     - Prevent samples from phoning home"
+    echo -e "  ${GREEN}•${RESET} ${BOLD}Sensitive Operations${RESET} - Work on confidential data offline"
+    echo -e "  ${GREEN}•${RESET} ${BOLD}Privacy Protection${RESET}   - Temporary network blackout"
+    echo -e "  ${GREEN}•${RESET} ${BOLD}Testing & Development${RESET}- Simulate offline conditions"
+    echo ""
+    
+    # Isolation Layers
+    echo -e "  ${BOLD}${CYAN}ISOLATION LAYERS${RESET}"
+    echo -e "  ─────────────────────────────────────────────────────────────────"
+    echo -e "  Airlock applies ${BOLD}11 layers${RESET} of network isolation:"
+    echo ""
+    echo -e "   ${DIM}Layer${RESET}  ${BOLD}Mechanism${RESET}                 ${DIM}Description${RESET}"
+    echo -e "   ─────  ─────────────────────────  ─────────────────────────────"
+    echo -e "    1     Process Termination        Kill NetworkManager, dhcpcd, etc."
+    echo -e "    2     rfkill                     Block all wireless radios"
+    echo -e "    3     DNS Flush                  Clear and disable DNS resolution"
+    echo -e "    4     iptables/ip6tables         DROP all INPUT/OUTPUT/FORWARD"
+    echo -e "    5     Blackhole Routing          Route all traffic to nowhere"
+    echo -e "    6     Interface Down             Disable all network interfaces"
+    echo -e "    7     Module Unload ${DIM}(paranoid)${RESET}   Remove NIC kernel modules"
+    echo -e "    8     Module Blacklist ${DIM}(vault)${RESET}   Prevent module reloading"
+    echo -e "    9     USB Block ${DIM}(vault)${RESET}          Block USB network devices"
+    echo -e "   10     Cache Clear                Flush ARP, routing, conntrack"
+    echo -e "   11     Memory Sanitize ${DIM}(vault)${RESET}    Clear clipboards, drop caches"
+    echo ""
+    
+    # Modes
+    echo -e "  ${BOLD}${CYAN}ISOLATION MODES${RESET}"
+    echo -e "  ─────────────────────────────────────────────────────────────────"
+    echo ""
+    echo -e "  ${GREEN}██${RESET} ${BOLD}Standard Mode${RESET} (default)"
+    echo -e "     Layers 1-6, 10 active. Good for most use cases."
+    echo -e "     Network can be restored quickly."
+    echo ""
+    echo -e "  ${YELLOW}██${RESET} ${BOLD}Paranoid Mode${RESET} (--paranoid)"
+    echo -e "     Adds Layer 7: Unloads NIC kernel modules."
+    echo -e "     Even if firewall is bypassed, no hardware driver exists."
+    echo ""
+    echo -e "  ${MAGENTA}██${RESET} ${BOLD}Vault Mode${RESET} (--vault)"
+    echo -e "     ${BOLD}Maximum isolation${RESET} - All 11 layers active."
+    echo -e "     USB network adapters blocked, modules blacklisted,"
+    echo -e "     memory sanitized. For high-security scenarios."
+    echo ""
+    
+    # Commands
+    echo -e "  ${BOLD}${CYAN}COMMANDS${RESET}"
+    echo -e "  ─────────────────────────────────────────────────────────────────"
+    echo ""
+    echo -e "   ${BOLD}Command${RESET}         ${DIM}Alias${RESET}     ${BOLD}Description${RESET}"
+    echo -e "   ─────────────  ────────  ──────────────────────────────────────"
+    echo -e "   seal           on        Seal the airlock (block all network)"
+    echo -e "   unseal         off       Unseal and restore network connectivity"
+    echo -e "   status         -         Show current isolation state"
+    echo -e "   monitor        -         Live view of blocked connection attempts"
+    echo -e "   log            -         View blocked connection summary"
+    echo -e "   repair         -         Force network recovery"
+    echo -e "   clear          -         Clear all logs"
+    echo -e "   help           -h, ?     Show this help screen"
+    echo ""
+    
+    # Options
+    echo -e "  ${BOLD}${CYAN}OPTIONS${RESET}"
+    echo -e "  ─────────────────────────────────────────────────────────────────"
+    echo ""
+    echo -e "   ${BOLD}Option${RESET}              ${BOLD}Description${RESET}"
+    echo -e "   ────────────────   ──────────────────────────────────────────"
+    echo -e "   --paranoid         Enable paranoid mode (unload modules)"
+    echo -e "   --vault            Enable vault mode (maximum isolation)"
+    echo -e "   --watchdog         Auto-unseal after 300 seconds (default)"
+    echo -e "   --watchdog=SEC     Auto-unseal after SEC seconds"
+    echo ""
+    
+    # Examples
+    echo -e "  ${BOLD}${CYAN}EXAMPLES${RESET}"
+    echo -e "  ─────────────────────────────────────────────────────────────────"
+    echo ""
+    echo -e "   ${DIM}\$${RESET} ${GREEN}doas ./airlock${RESET}                    ${DIM}# Interactive menu${RESET}"
+    echo -e "   ${DIM}\$${RESET} ${GREEN}doas ./airlock seal${RESET}               ${DIM}# Standard seal${RESET}"
+    echo -e "   ${DIM}\$${RESET} ${GREEN}doas ./airlock seal --paranoid${RESET}    ${DIM}# With module unloading${RESET}"
+    echo -e "   ${DIM}\$${RESET} ${GREEN}doas ./airlock seal --vault${RESET}       ${DIM}# Maximum isolation${RESET}"
+    echo -e "   ${DIM}\$${RESET} ${GREEN}doas ./airlock seal --watchdog=600${RESET} ${DIM}# Auto-unseal in 10 min${RESET}"
+    echo -e "   ${DIM}\$${RESET} ${GREEN}doas ./airlock unseal${RESET}             ${DIM}# Restore network${RESET}"
+    echo -e "   ${DIM}\$${RESET} ${GREEN}doas ./airlock status${RESET}             ${DIM}# Check current state${RESET}"
+    echo -e "   ${DIM}\$${RESET} ${GREEN}doas ./airlock monitor${RESET}            ${DIM}# Watch blocked traffic${RESET}"
+    echo ""
+    
+    # FAQ
+    echo -e "  ${BOLD}${CYAN}FREQUENTLY ASKED QUESTIONS${RESET}"
+    echo -e "  ─────────────────────────────────────────────────────────────────"
+    echo ""
+    echo -e "  ${BOLD}Q: Is this a true airgap?${RESET}"
+    echo -e "  A: No. A true airgap requires physical isolation (no network"
+    echo -e "     hardware). Airlock is a ${BOLD}software-based${RESET} approximation that"
+    echo -e "     provides defense-in-depth through multiple layers."
+    echo ""
+    echo -e "  ${BOLD}Q: Can malware bypass Airlock?${RESET}"
+    echo -e "  A: Sophisticated malware with kernel-level access might bypass"
+    echo -e "     software controls. For high-security needs, use Vault mode"
+    echo -e "     and consider physical airgapping."
+    echo ""
+    echo -e "  ${BOLD}Q: What if unseal doesn't restore my network?${RESET}"
+    echo -e "  A: Run '${GREEN}airlock repair${RESET}' to force network recovery. If that"
+    echo -e "     fails, reboot the system."
+    echo ""
+    echo -e "  ${BOLD}Q: Why does Vault mode kill processes?${RESET}"
+    echo -e "  A: Network daemons can automatically reconnect or reconfigure"
+    echo -e "     networking. Terminating them prevents this."
+    echo ""
+    echo -e "  ${BOLD}Q: What is the watchdog for?${RESET}"
+    echo -e "  A: Safety feature. If you accidentally lock yourself out remotely,"
+    echo -e "     the watchdog auto-unseals after the timeout."
+    echo ""
+    
+    # Files
+    echo -e "  ${BOLD}${CYAN}FILES & LOCATIONS${RESET}"
+    echo -e "  ─────────────────────────────────────────────────────────────────"
+    echo ""
+    echo -e "   ${BOLD}Path${RESET}                               ${BOLD}Purpose${RESET}"
+    echo -e "   ─────────────────────────────────   ─────────────────────────"
+    echo -e "   /var/run/airlock.state              Current state file"
+    echo -e "   /var/log/airlock/airlock.log        Main log file"
+    echo -e "   /var/log/airlock/blocked.log        Blocked connections log"
+    echo -e "   /etc/modprobe.d/airlock-block.conf  Module blacklist (vault)"
+    echo -e "   /etc/udev/rules.d/99-airlock-*      USB blocking rules (vault)"
+    echo ""
+    
+    # Requirements
+    echo -e "  ${BOLD}${CYAN}REQUIREMENTS${RESET}"
+    echo -e "  ─────────────────────────────────────────────────────────────────"
+    echo -e "   ${GREEN}•${RESET} Root/sudo access (required)"
+    echo -e "   ${GREEN}•${RESET} iproute2 (ip command)"
+    echo -e "   ${GREEN}•${RESET} iptables"
+    echo -e "   ${YELLOW}•${RESET} rfkill (optional, for wireless control)"
+    echo -e "   ${YELLOW}•${RESET} conntrack (optional, for connection tracking flush)"
+    echo ""
+    
+    # Compatibility
+    echo -e "  ${BOLD}${CYAN}COMPATIBILITY${RESET}"
+    echo -e "  ─────────────────────────────────────────────────────────────────"
+    echo -e "   Designed for Void Linux, tested on:"
+    echo -e "   ${GREEN}•${RESET} Void Linux (runit)"
+    echo -e "   ${GREEN}•${RESET} Arch Linux (systemd)"
+    echo -e "   ${GREEN}•${RESET} Debian/Ubuntu (systemd)"
+    echo -e "   ${GREEN}•${RESET} Gentoo (OpenRC)"
+    echo -e "   ${GREEN}•${RESET} Alpine Linux (OpenRC)"
+    echo ""
+    
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════════════${RESET}"
+    echo -e "  Version ${VERSION} | https://github.com/djenkins93/airlock${RESET}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════════════${RESET}"
+    echo ""
+}
+
+# === Interactive Menu ===
+main_menu() {
+    show_banner
+    
+    while true; do
+        echo ""
+        if check_state; then
+            local mode=""
+            [ -f "$STATE_FILE" ] && grep -q "VAULT=true" "$STATE_FILE" && mode=" [VAULT]"
+            [ -f "$STATE_FILE" ] && grep -q "PARANOID=true" "$STATE_FILE" && [ -z "$mode" ] && mode=" [PARANOID]"
+            echo -e "  Current Status: ${RED}██ SEALED${RESET}${mode} ($(get_activation_time))"
+        else
+            echo -e "  Current Status: ${GREEN}██ UNSEALED${RESET}"
+        fi
+        echo ""
+        echo "  ┌──────────────────────────────────────────┐"
+        echo "  │                                          │"
+        echo "  │   1.  Seal airlock    (block network)    │"
+        echo "  │   2.  Unseal airlock  (restore network)  │"
+        echo "  │   3.  Show status                        │"
+        echo "  │   4.  Monitor blocked traffic            │"
+        echo "  │   5.  View blocked log                   │"
+        echo "  │   6.  Force repair network               │"
+        echo "  │   7.  Clear logs                         │"
+        echo "  │                                          │"
+        echo -e "  │   P.  Paranoid mode  [$([ "$PARANOID_MODE" = "true" ] && echo -e "${YELLOW}ON ${RESET}" || echo -e "${DIM}OFF${RESET}")]               │"
+        echo -e "  │   V.  Vault mode     [$([ "$VAULT_MODE" = "true" ] && echo -e "${MAGENTA}ON ${RESET}" || echo -e "${DIM}OFF${RESET}")]               │"
+        echo -e "  │   W.  Watchdog       [$([ "$WATCHDOG_ENABLED" = "true" ] && echo -e "${YELLOW}ON ${RESET}" || echo -e "${DIM}OFF${RESET}")]               │"
+        echo "  │                                          │"
+        echo "  │   H.  Help / FAQ                         │"
+        echo "  │   0.  Exit                               │"
+        echo "  │                                          │"
+        echo "  └──────────────────────────────────────────┘"
+        echo ""
+        read -rp "  Select option: " choice
+
+        case "$choice" in
+            1) airlock_seal ;;
+            2) airlock_unseal ;;
+            3) status_check ;;
+            4) monitor_traffic ;;
+            5) view_blocked_log ;;
+            6) force_repair ;;
+            7) clear_logs ;;
+            [pP]) 
+                if [ "$PARANOID_MODE" = "true" ]; then
+                    PARANOID_MODE=false
+                    log "Paranoid mode disabled"
+                else
+                    PARANOID_MODE=true
+                    log_warn "Paranoid mode enabled"
+                fi
+                ;;
+            [vV])
+                if [ "$VAULT_MODE" = "true" ]; then
+                    VAULT_MODE=false
+                    log "Vault mode disabled"
+                else
+                    VAULT_MODE=true
+                    PARANOID_MODE=true  # Vault implies paranoid
+                    log_warn "Vault mode enabled (includes paranoid mode)"
+                fi
+                ;;
+            [wW])
+                if [ "$WATCHDOG_ENABLED" = "true" ]; then
+                    WATCHDOG_ENABLED=false
+                    log "Watchdog disabled"
+                else
+                    WATCHDOG_ENABLED=true
+                    read -rp "  Timeout in seconds [${WATCHDOG_TIMEOUT}]: " new_timeout
+                    [ -n "$new_timeout" ] && WATCHDOG_TIMEOUT="$new_timeout"
+                    log "Watchdog enabled (${WATCHDOG_TIMEOUT}s)"
+                fi
+                ;;
+            [hH?])
+                show_help
+                ;;
+            0|[qQ]) 
+                echo ""
+                log "Exiting Airlock."
+                exit 0
+                ;;
+            *) echo -e "  ${RED}Invalid option.${RESET}" ;;
+        esac
+    done
+}
+
+# === Quick Help (CLI) ===
+show_quick_help() {
+    cat << EOF
+${BOLD}Airlock v${VERSION}${RESET} - Software-based airgap utility
+
+${BOLD}USAGE${RESET}
+    airlock [command] [options]
+
+${BOLD}COMMANDS${RESET}
+    seal, on        Seal the airlock (block all network)
+    unseal, off     Unseal the airlock (restore network)
+    status          Show current state
+    monitor         Live blocked traffic monitor
+    log             View blocked connection summary
+    repair          Force network repair
+    clear           Clear all logs
+    help, -h, ?     Show detailed help and FAQ
+
+${BOLD}OPTIONS${RESET}
+    --paranoid      Unload kernel modules
+    --vault         Maximum isolation (USB block, process kill, etc.)
+    --watchdog      Auto-unseal after 300s
+    --watchdog=SEC  Auto-unseal after SEC seconds
+
+${BOLD}ISOLATION MODES${RESET}
+    Standard:   Firewall + blackhole + rfkill + interfaces + DNS
+    Paranoid:   + kernel module unloading
+    Vault:      + USB blocking + module load prevention + process kill + memory wipe
+
+${BOLD}EXAMPLES${RESET}
+    airlock seal                    # Standard seal
+    airlock seal --paranoid         # With module unloading
+    airlock seal --vault            # Maximum isolation
+    airlock seal --watchdog=600     # 10-min auto-unseal
+    airlock unseal                  # Restore network
+
+${BOLD}FILES${RESET}
+    /var/run/airlock.state          State file
+    /var/log/airlock/               Log directory
+    /etc/modprobe.d/airlock-*.conf  Module blocking (vault)
+    /etc/udev/rules.d/99-airlock-*  USB blocking (vault)
+
+Run 'airlock help' for detailed documentation and FAQ.
+EOF
+}
+
+# === Root Check ===
+if [ "$(id -u)" -ne 0 ]; then
+    echo -e "${RED}Error: Airlock must be run as root.${RESET}"
+    echo -e "${DIM}Usage: sudo ./airlock [command] or doas ./airlock [command]${RESET}"
+    exit 1
+fi
+
+# === Parse Arguments ===
+COMMAND=""
+for arg in "$@"; do
+    case "$arg" in
+        --paranoid)
+            PARANOID_MODE=true
+            ;;
+        --vault|--bunker)
+            VAULT_MODE=true
+            PARANOID_MODE=true
+            ;;
+        --watchdog)
+            WATCHDOG_ENABLED=true
+            ;;
+        --watchdog=*)
+            WATCHDOG_ENABLED=true
+            WATCHDOG_TIMEOUT="${arg#*=}"
+            ;;
+        seal|on|unseal|off|status|monitor|log|repair|clear|help|--help|-h|\?)
+            COMMAND="$arg"
+            ;;
+    esac
+done
+
+# Show help without requiring dependencies
+case "$COMMAND" in
+    help|--help|-h|\?)
+        show_help
+        exit 0
+        ;;
+esac
+
+# Check dependencies for all other commands
+check_dependencies
+
+case "$COMMAND" in
+    seal|on)
+        show_banner
+        airlock_seal
+        ;;
+    unseal|off)
+        show_banner
+        airlock_unseal
+        ;;
+    status)
+        show_banner
+        status_check
+        ;;
+    monitor)
+        show_banner
+        monitor_traffic
+        ;;
+    log)
+        show_banner
+        view_blocked_log
+        ;;
+    repair)
+        show_banner
+        force_repair
+        ;;
+    clear)
+        clear_logs
+        ;;
+    "")
+        main_menu
+        ;;
+    *)
+        show_quick_help
+        exit 1
+        ;;
+esac
